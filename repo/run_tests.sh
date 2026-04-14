@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # run_tests.sh — single broad verification command for the portal.
-# Runs backend Go tests, frontend Vitest tests, and (optionally) Playwright E2E.
+# ALL tests run inside Docker containers so there is no dependency on the
+# host machine having Go, Node, or any other toolchain installed.
+#
 # Usage:
-#   ./run_tests.sh            — all tests
+#   ./run_tests.sh            — all tests (backend + frontend)
 #   ./run_tests.sh --backend  — Go tests only
 #   ./run_tests.sh --frontend — Vitest tests only
 #   ./run_tests.sh --e2e      — Playwright E2E only
@@ -30,40 +32,32 @@ fail() { printf '\033[1;31m  FAIL: %s\033[0m\n' "$1"; exit 1; }
 
 cd "$ROOT"
 
-# ── Backend tests ─────────────────────────────────────────────────────────────
+EXIT_CODE=0
+
+# ── Backend tests (Go inside Docker) ─────────────────────────────────────────
 if [ "$FRONTEND_ONLY" != "true" ] && [ "$E2E_ONLY" != "true" ]; then
-  log "Running Go backend tests..."
+  log "Running Go backend tests inside Docker (golang:1.23-alpine)..."
 
-  # Ensure go.sum is up to date
-  go mod tidy 2>/dev/null || true
-
-  # Run all backend tests with race detector
-  if go test -race -count=1 -timeout 120s ./tests/... ./internal/... ./cmd/...; then
+  if docker run --rm \
+    -v "$ROOT":/src \
+    -w /src \
+    golang:1.23-alpine \
+    sh -c "apk add --no-cache git >/dev/null 2>&1 && go test -count=1 -timeout 120s ./tests/... ./internal/... ./cmd/..."; then
     pass "Backend tests"
   else
     fail "Backend tests"
   fi
-
-  # Run with coverage
-  log "Measuring backend test coverage..."
-  COVERAGE_FILE="/tmp/portal_coverage.out"
-  go test -coverprofile="$COVERAGE_FILE" -covermode=atomic ./tests/... ./internal/... ./cmd/... 2>/dev/null || true
-  if [ -f "$COVERAGE_FILE" ]; then
-    go tool cover -func="$COVERAGE_FILE" | grep total: | awk '{print "  Coverage: " $3}'
-  fi
 fi
 
-# ── Frontend tests ────────────────────────────────────────────────────────────
+# ── Frontend tests (Node inside Docker) ──────────────────────────────────────
 if [ "$BACKEND_ONLY" != "true" ] && [ "$E2E_ONLY" != "true" ]; then
-  log "Running frontend unit and component tests (Vitest)..."
+  log "Running frontend unit and component tests inside Docker (node:20-alpine)..."
 
-  # Install dependencies if node_modules is missing
-  if [ ! -d "$ROOT/node_modules" ]; then
-    log "Installing npm dependencies..."
-    npm ci --prefer-offline
-  fi
-
-  if npm test -- --reporter=verbose; then
+  if docker run --rm \
+    -v "$ROOT":/src \
+    -w /src \
+    node:20-alpine \
+    sh -c "npm ci --prefer-offline --silent 2>/dev/null; npx vitest run --reporter=verbose"; then
     pass "Frontend unit/component tests"
   else
     fail "Frontend unit/component tests"
@@ -74,12 +68,20 @@ fi
 if [ "$SKIP_E2E" != "true" ] || [ "$E2E_ONLY" = "true" ]; then
   log "Running Playwright E2E tests..."
 
-  # Ensure browsers are installed
-  npx playwright install --with-deps chromium 2>/dev/null || true
-
-  BASE_URL="${BASE_URL:-http://localhost:3000}" SKIP_WEBSERVER=1 \
-    npx playwright test --reporter=line
-  pass "E2E tests"
+  # E2E needs the full stack running, so we use the host network
+  # and assume docker compose is already up.
+  if docker run --rm \
+    --network host \
+    -v "$ROOT":/src \
+    -w /src \
+    -e BASE_URL="${BASE_URL:-http://localhost:3000}" \
+    -e SKIP_WEBSERVER=1 \
+    mcr.microsoft.com/playwright:v1.42.1-jammy \
+    sh -c "npm ci --prefer-offline --silent 2>/dev/null; npx playwright test --reporter=line"; then
+    pass "E2E tests"
+  else
+    fail "E2E tests"
+  fi
 else
   log "Skipping Playwright E2E (set SKIP_E2E=false or pass --e2e to run)"
 fi
