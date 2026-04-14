@@ -1,0 +1,35 @@
+# Local/Temporary
+.DS_Store
+Thumbs.db
+
+# Secrets
+*.env
+.env.*
+!.env.example
+
+# Node/Web
+**/node_modules/
+**/dist/
+**/.npm/
+
+# Go
+**/bin/
+**/*.exe
+**/*.test
+**/coverage.out
+**/coverage.html
+
+# Docker/Storage
+**/postgres_data/
+repo/storage/private/runtime/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test artifacts
+repo/playwright-report/
+repo/test-results/
+repo/coverage/

@@ -1,0 +1,162 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Workforce Learning & Procurement Reconciliation Portal
+# Canonical startup: ./run.sh  (generates secrets on first boot, then composes)
+#   OR, after first run: docker compose up --build
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── One-shot runtime secret generator ──────────────────────────────────────
+  bootstrap:
+    image: alpine:3.19
+    volumes:
+      - ./infra/bootstrap:/bootstrap:ro
+      - runtime_secrets:/runtime/secrets
+    environment:
+      - SECRETS_DIR=/runtime/secrets
+    command: ["/bootstrap/bootstrap-runtime.sh"]
+    restart: "no"
+    networks:
+      - portal
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB:   postgres
+      POSTGRES_PASSWORD_FILE: /runtime/secrets/db_superpassword.txt
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/postgres.conf:/etc/postgresql/postgresql.conf:ro
+      - runtime_secrets:/runtime/secrets:ro
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -q"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - portal
+
+  # ── Go API server ───────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+      target: production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      - APP_ENV=production
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - SECRETS_DIR=/runtime/secrets
+      - STORAGE_PATH=/app/storage
+      - MIGRATIONS_DIR=/app/migrations
+      - SEEDS_DIR=/app/seeds
+    volumes:
+      - runtime_secrets:/runtime/secrets:ro
+      - app_storage:/app/storage
+      - ./migrations:/app/migrations:ro
+      - ./seeds:/app/seeds:ro
+    entrypoint: ["/app/infra/bootstrap/entrypoint-api.sh"]
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/api/health 2>/dev/null | grep -q ok || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+    networks:
+      - portal
+
+  # ── Background worker ───────────────────────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+      target: production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      - APP_ENV=production
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - SECRETS_DIR=/runtime/secrets
+      - STORAGE_PATH=/app/storage
+      - MIGRATIONS_DIR=/app/migrations
+      - SEEDS_DIR=/app/seeds
+    volumes:
+      - runtime_secrets:/runtime/secrets:ro
+      - app_storage:/app/storage
+      - ./migrations:/app/migrations:ro
+      - ./seeds:/app/seeds:ro
+    entrypoint: ["/app/infra/bootstrap/entrypoint-worker.sh"]
+    networks:
+      - portal
+
+  # ── Scheduler ───────────────────────────────────────────────────────────────
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+      target: production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      - APP_ENV=production
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - SECRETS_DIR=/runtime/secrets
+      - STORAGE_PATH=/app/storage
+      - MIGRATIONS_DIR=/app/migrations
+      - SEEDS_DIR=/app/seeds
+    volumes:
+      - runtime_secrets:/runtime/secrets:ro
+      - app_storage:/app/storage
+      - ./migrations:/app/migrations:ro
+      - ./seeds:/app/seeds:ro
+    entrypoint: ["/app/infra/bootstrap/entrypoint-scheduler.sh"]
+    networks:
+      - portal
+
+  # ── React frontend via Nginx ────────────────────────────────────────────────
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "3000:80"
+    networks:
+      - portal
+
+volumes:
+  postgres_data:
+    driver: local
+  runtime_secrets:
+    driver: local
+  app_storage:
+    driver: local
+
+networks:
+  portal:
+    driver: bridge

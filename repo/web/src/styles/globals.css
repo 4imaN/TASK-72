@@ -1,0 +1,66 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* Dark-first theme — matches the navy-with-amber-accent design language
+     used by the sidebar and all content pages. The :root variables define
+     the dark palette directly so every Tailwind utility (bg-background,
+     bg-card, text-foreground, border, bg-muted, etc.) resolves to the
+     correct dark shade without needing a .dark class on <html>. */
+  :root {
+    /* Core surfaces */
+    --background: 225 20% 7%;          /* #0f1219 — main content area */
+    --foreground: 220 10% 90%;         /* #e2e4ea — primary text */
+
+    /* Cards, modals, panels */
+    --card: 225 18% 10%;               /* #161922 — elevated surfaces */
+    --card-foreground: 220 10% 90%;
+
+    /* Popovers, dropdowns */
+    --popover: 225 18% 10%;
+    --popover-foreground: 220 10% 90%;
+
+    /* Primary action — warm amber */
+    --primary: 38 92% 50%;             /* #f59e0b */
+    --primary-foreground: 0 0% 100%;   /* white on amber */
+
+    /* Secondary surfaces */
+    --secondary: 225 15% 14%;          /* slightly lighter than card */
+    --secondary-foreground: 220 10% 85%;
+
+    /* Muted — used for subtle backgrounds, badges, disabled states */
+    --muted: 225 15% 14%;
+    --muted-foreground: 220 10% 55%;   /* zinc-400 range */
+
+    /* Accent — hover highlights */
+    --accent: 225 15% 16%;
+    --accent-foreground: 220 10% 90%;
+
+    /* Destructive — red tones */
+    --destructive: 0 72% 51%;          /* red-500 */
+    --destructive-foreground: 0 0% 100%;
+
+    /* Borders & inputs */
+    --border: 225 10% 18%;             /* subtle white/8 equivalent */
+    --input: 225 10% 18%;
+    --ring: 38 92% 50%;                /* amber focus ring */
+    --radius: 0.625rem;               /* 10px — slightly rounder */
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+}
+
+/* Focus visible styles for accessibility */
+:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 2px;
+}

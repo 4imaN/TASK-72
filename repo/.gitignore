@@ -1,0 +1,34 @@
+# Secrets and runtime state
+storage/private/runtime/
+*.env
+.env.*
+!.env.example
+
+# Go build artifacts
+bin/
+dist/
+*.exe
+*.test
+coverage.out
+coverage.html
+
+# Node.js
+node_modules/
+web/dist/
+.npm/
+
+# Docker volumes
+postgres_data/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Test artifacts
+/tmp/
+playwright-report/
+test-results/
+coverage/

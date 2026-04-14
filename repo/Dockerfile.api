@@ -1,0 +1,39 @@
+# ── Build stage ───────────────────────────────────────────────────────────────
+FROM golang:1.23-alpine AS builder
+
+RUN apk add --no-cache git ca-certificates tzdata postgresql-client
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o /bin/api      ./cmd/api      && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o /bin/worker   ./cmd/worker   && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o /bin/scheduler ./cmd/scheduler
+
+# ── Production stage ──────────────────────────────────────────────────────────
+FROM alpine:3.19 AS production
+
+RUN apk add --no-cache ca-certificates tzdata postgresql-client bash curl wget
+
+WORKDIR /app
+
+COPY --from=builder /bin/api        /app/bin/api
+COPY --from=builder /bin/worker     /app/bin/worker
+COPY --from=builder /bin/scheduler  /app/bin/scheduler
+COPY infra/bootstrap/ /app/infra/bootstrap/
+COPY init_db.sh      /app/init_db.sh
+
+RUN chmod +x /app/infra/bootstrap/bootstrap-runtime.sh \
+             /app/infra/bootstrap/entrypoint-api.sh \
+             /app/infra/bootstrap/entrypoint-worker.sh \
+             /app/infra/bootstrap/entrypoint-scheduler.sh \
+             /app/init_db.sh
+
+RUN mkdir -p /app/storage/private/evidence \
+             /app/storage/private/exports \
+             /app/storage/private/search \
+             /app/storage/logs
+
+EXPOSE 8080
