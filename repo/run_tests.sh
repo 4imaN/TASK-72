@@ -2,10 +2,10 @@
 # run_tests.sh — runs ALL available tests in the codebase.
 #
 # By default this script runs every test layer:
-#   1. Go backend unit/api/security/integration tests
-#   2. Frontend Vitest unit/component tests
-#   3. Playwright E2E smoke tests (requires running stack)
-#   4. External HTTP API tests against the live Docker stack
+#   1. Go backend unit/api/security/integration tests (in a Docker container)
+#   2. Frontend Vitest unit/component tests (in a Docker container)
+#   3. Playwright E2E smoke tests (needs the stack running)
+#   4. External HTTP API tests (needs the stack running)
 #
 # Usage:
 #   ./run_tests.sh              — all tests
@@ -41,21 +41,38 @@ run_all() {
   [ "$E2E_ONLY" = false ] && [ "$EXTERNAL_ONLY" = false ]
 }
 
-# ── Extract bootstrap passwords from Docker secrets ──────────────────────────
-extract_passwords() {
-  log "Extracting bootstrap passwords from Docker secrets..."
-  export ADMIN_PW=$(docker compose exec -T api cat /runtime/secrets/bootstrap_pw_admin.txt 2>/dev/null || echo "")
-  export FINANCE_PW=$(docker compose exec -T api cat /runtime/secrets/bootstrap_pw_finance.txt 2>/dev/null || echo "")
-  export PROCUREMENT_PW=$(docker compose exec -T api cat /runtime/secrets/bootstrap_pw_procurement.txt 2>/dev/null || echo "")
-  export APPROVER_PW=$(docker compose exec -T api cat /runtime/secrets/bootstrap_pw_approver.txt 2>/dev/null || echo "")
-  export LEARNER_PW=$(docker compose exec -T api cat /runtime/secrets/bootstrap_pw_learner.txt 2>/dev/null || echo "")
-  export MODERATOR_PW=$(docker compose exec -T api cat /runtime/secrets/bootstrap_pw_moderator.txt 2>/dev/null || echo "")
-  if [ -z "$ADMIN_PW" ]; then
-    log "WARNING: Could not extract passwords. Is the Docker stack running?"
+# ── Ensure Docker stack is running for E2E + external tests ──────────────────
+ensure_stack() {
+  log "Ensuring Docker stack is running..."
+  if ! docker compose ps --format json 2>/dev/null | grep -q '"api"'; then
+    log "Starting Docker stack..."
+    docker compose up --build -d
+    log "Waiting for API health check..."
+    for i in $(seq 1 60); do
+      if curl -sf http://localhost:8080/api/health >/dev/null 2>&1; then
+        log "API is healthy."
+        return 0
+      fi
+      sleep 2
+    done
+    log "ERROR: API did not become healthy in 120s"
+    return 1
+  else
+    log "Stack already running."
   fi
 }
 
-# ── 1. Backend tests (Go) ───────────────────────────────────────────────────
+# ── Extract bootstrap passwords from Docker secrets ──────────────────────────
+extract_passwords() {
+  export ADMIN_PW=$(docker compose exec -T api cat /runtime/secrets/bootstrap_pw_admin.txt 2>/dev/null | tr -d '\r\n' || echo "")
+  export FINANCE_PW=$(docker compose exec -T api cat /runtime/secrets/bootstrap_pw_finance.txt 2>/dev/null | tr -d '\r\n' || echo "")
+  export PROCUREMENT_PW=$(docker compose exec -T api cat /runtime/secrets/bootstrap_pw_procurement.txt 2>/dev/null | tr -d '\r\n' || echo "")
+  export APPROVER_PW=$(docker compose exec -T api cat /runtime/secrets/bootstrap_pw_approver.txt 2>/dev/null | tr -d '\r\n' || echo "")
+  export LEARNER_PW=$(docker compose exec -T api cat /runtime/secrets/bootstrap_pw_learner.txt 2>/dev/null | tr -d '\r\n' || echo "")
+  export MODERATOR_PW=$(docker compose exec -T api cat /runtime/secrets/bootstrap_pw_moderator.txt 2>/dev/null | tr -d '\r\n' || echo "")
+}
+
+# ── 1. Backend tests (Go inside Docker) ─────────────────────────────────────
 if run_all || [ "$BACKEND_ONLY" = true ]; then
   log "Running Go backend tests (unit + api + security + integration + scheduler)..."
 
@@ -70,7 +87,7 @@ if run_all || [ "$BACKEND_ONLY" = true ]; then
   fi
 fi
 
-# ── 2. Frontend tests (Vitest) ──────────────────────────────────────────────
+# ── 2. Frontend tests (Vitest inside Docker) ────────────────────────────────
 if run_all || [ "$FRONTEND_ONLY" = true ]; then
   log "Running frontend Vitest unit/component tests..."
 
@@ -85,9 +102,11 @@ if run_all || [ "$FRONTEND_ONLY" = true ]; then
   fi
 fi
 
-# ── 3. Playwright E2E ───────────────────────────────────────────────────────
+# ── 3. Playwright E2E (needs running stack) ─────────────────────────────────
 if run_all || [ "$E2E_ONLY" = true ]; then
-  log "Running Playwright E2E tests (requires running stack)..."
+  ensure_stack
+
+  log "Running Playwright E2E tests..."
 
   if docker run --rm \
     --network host \
@@ -103,15 +122,25 @@ if run_all || [ "$E2E_ONLY" = true ]; then
   fi
 fi
 
-# ── 4. External HTTP API tests ──────────────────────────────────────────────
+# ── 4. External HTTP API tests (needs running stack) ────────────────────────
 if run_all || [ "$EXTERNAL_ONLY" = true ]; then
+  ensure_stack
   extract_passwords
 
-  log "Running external HTTP API tests against live Docker stack..."
+  log "Running external HTTP API tests against live stack..."
 
-  if ADMIN_PW="$ADMIN_PW" FINANCE_PW="$FINANCE_PW" PROCUREMENT_PW="$PROCUREMENT_PW" \
-     APPROVER_PW="$APPROVER_PW" LEARNER_PW="$LEARNER_PW" MODERATOR_PW="$MODERATOR_PW" \
-     go test -v -count=1 -timeout 120s ./tests/external/...; then
+  if docker run --rm \
+    --network host \
+    -v "$ROOT":/src \
+    -w /src \
+    -e ADMIN_PW="$ADMIN_PW" \
+    -e FINANCE_PW="$FINANCE_PW" \
+    -e PROCUREMENT_PW="$PROCUREMENT_PW" \
+    -e APPROVER_PW="$APPROVER_PW" \
+    -e LEARNER_PW="$LEARNER_PW" \
+    -e MODERATOR_PW="$MODERATOR_PW" \
+    golang:1.23-alpine \
+    sh -c "apk add --no-cache git >/dev/null 2>&1 && go test -v -count=1 -timeout 120s ./tests/external/..."; then
     pass "External HTTP API tests"
   else
     fail "External HTTP API tests"

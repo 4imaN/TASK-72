@@ -86,8 +86,9 @@ services:
       context: .
       dockerfile: Dockerfile.api
       target: production
+    restart: on-failure
     depends_on:
-      postgres:
+      api:
         condition: service_healthy
       bootstrap:
         condition: service_completed_successfully
@@ -114,8 +115,9 @@ services:
       context: .
       dockerfile: Dockerfile.api
       target: production
+    restart: on-failure
     depends_on:
-      postgres:
+      api:
         condition: service_healthy
       bootstrap:
         condition: service_completed_successfully
