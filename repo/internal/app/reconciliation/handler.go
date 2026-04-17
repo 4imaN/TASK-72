@@ -155,6 +155,11 @@ func (h *Handler) CreateRun(c echo.Context) error {
 // ProcessRun handles POST /api/v1/reconciliation/runs/:id/process
 func (h *Handler) ProcessRun(c echo.Context) error {
 	runID := c.Param("id")
+	// Resolve the run first so a missing id returns 404 instead of the generic
+	// 500 we used to leak through ProcessRun's wrapped pgx.ErrNoRows.
+	if _, err := h.store.GetRun(c.Request().Context(), runID); err != nil {
+		return common.ErrorResponse(c, http.StatusNotFound, "reconciliation.not_found", "Run not found")
+	}
 	err := h.store.ProcessRun(c.Request().Context(), runID)
 	if err != nil {
 		if isNotFoundOrState(err) {

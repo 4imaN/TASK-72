@@ -22,5 +22,6 @@
     "types": ["vitest/globals"]
   },
   "include": ["web/src"],
+  "exclude": ["web/src/tests/e2e/**"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

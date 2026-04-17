@@ -105,7 +105,7 @@ type AuditEvent struct {
 	OldValue   json.RawMessage `json:"old_value,omitempty"`
 	NewValue   json.RawMessage `json:"new_value,omitempty"`
 	IPAddress  *string         `json:"ip_address,omitempty"`
-	CreatedAt  time.Time       `json:"created_at"`
+	CreatedAt  time.Time       `json:"created_at"` // populated from occurred_at column
 }
 
 // ListEvents returns paginated audit events filtered by userID and/or action.
@@ -138,9 +138,9 @@ func (s *Store) ListEvents(ctx context.Context, userID, action string, limit, of
 
 	query := fmt.Sprintf(`
 		SELECT id, actor_id, action, category, target_type, target_id,
-		       old_value, new_value, ip_address, created_at
+		       old_value, new_value, ip_address, occurred_at
 		FROM audit_logs
-		%s ORDER BY created_at DESC LIMIT $%d OFFSET $%d`,
+		%s ORDER BY occurred_at DESC LIMIT $%d OFFSET $%d`,
 		where, argN, argN+1,
 	)
 	args = append(args, limit, offset)

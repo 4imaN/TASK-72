@@ -1,5 +1,7 @@
 # Workforce Learning & Procurement Reconciliation Portal
 
+**Project Type:** fullstack (Go API + React SPA + PostgreSQL)
+
 A fully offline, local-network portal combining employee learning-path management with vendor order governance and financial reconciliation.
 
 ---
@@ -37,16 +39,48 @@ A fully offline, local-network portal combining employee learning-path managemen
 ## Startup
 
 ```bash
-./run.sh
+docker-compose up --build -d
 ```
 
-Or, after the first boot, the canonical command is:
+This single command builds all images, generates secrets, initializes the database, runs migrations + seeds, and starts all services. No manual `.env` creation is required.
+
+Equivalent modern syntax:
 
 ```bash
-docker compose up --build
+docker compose up --build -d
 ```
 
-No manual `.env` creation is required. Secrets are generated automatically by the `bootstrap` service on first boot and persisted in a Docker-managed named volume (`runtime_secrets`).
+Secrets are generated automatically by the `bootstrap` service on first boot and persisted in a Docker-managed named volume (`runtime_secrets`).
+
+### Verification
+
+After startup, verify the stack is working:
+
+```bash
+# 1. API health check
+curl http://localhost:8080/api/health
+# Expected: {"service":"portal-api","status":"ok"}
+
+# 2. Visit the web UI in your browser
+#    http://localhost:3000
+# Expected: Login page with "Welcome back" heading
+
+# 3. Log in with the admin account (see credentials below)
+# Expected: Dark-themed dashboard with sidebar navigation
+```
+
+### Demo Credentials
+
+All bootstrap accounts use deterministic passwords that are the same across every fresh deployment. Production deployments should rotate these after first boot.
+
+| Username | Email | Password | Role |
+|---|---|---|---|
+| `bootstrap_admin` | `admin@portal.local` | `Portal-Admin-2026!` | Admin (full access) |
+| `bootstrap_finance` | `finance@portal.local` | `Portal-Finance-2026!` | Finance |
+| `bootstrap_procurement` | `procurement@portal.local` | `Portal-Procurement-2026!` | Procurement |
+| `bootstrap_approver` | `approver@portal.local` | `Portal-Approver-2026!` | Approver |
+| `bootstrap_moderator` | `moderator@portal.local` | `Portal-Moderator-2026!` | Moderator |
+| `bootstrap_learner` | `learner@portal.local` | `Portal-Learner-2026!` | Learner |
 
 ---
 
@@ -85,17 +119,11 @@ Sensitive runtime values are generated on first boot by `infra/bootstrap/bootstr
 
 These are written to the Docker `runtime_secrets` named volume. **No plaintext secrets are ever logged or committed.**
 
-To view a bootstrap account password after first boot:
-
-```bash
-docker compose exec bootstrap sh -c "cat /runtime/secrets/bootstrap_pw_admin.txt"
-```
-
 ---
 
 ## Bootstrap Accounts
 
-One seeded account exists per role. All accounts require a **mandatory password rotation on first login**.
+One seeded account exists per role. All accounts use deterministic demo passwords (see [Demo Credentials](#demo-credentials) above). Production deployments should rotate these after first boot.
 
 | Username              | Role                 | Email                      |
 |-----------------------|----------------------|----------------------------|
@@ -255,41 +283,52 @@ Nothing in this product requires internet access. Cloud services are not used, n
 
 ---
 
-## Tests
+## Testing
+
+Run all tests with a single command:
 
 ```bash
-./run_tests.sh              # all tests (backend Go + frontend Vitest)
-./run_tests.sh --backend    # Go tests only
-./run_tests.sh --frontend   # Vitest tests only
-./run_tests.sh --e2e        # Playwright E2E (requires running stack)
-
-make test-fast              # Go fakes + source assertions; no external deps
-make test-integration       # Real PostgreSQL + real handler chain
-make test-e2e               # Playwright smoke suite
-make test-all               # all of the above
+./run_tests.sh
 ```
 
-There are three Go test layers:
+This runs every test layer in sequence:
 
-- **`tests/unit`** — store helpers and pure functions (e.g. URL validators,
-  recommendation dedup, scheduler timing). No DB.
-- **`tests/api` / `tests/security`** — handler-level tests with in-memory
-  fakes plus source-level assertions over `cmd/api/main.go` route
-  registrations. Catches handler bugs fast; misses real SQL/middleware
-  defects by design.
-- **`tests/integration`** — real PostgreSQL + the real Echo middleware chain.
-  Each test installs migrations + seeds into a per-test schema so the suite
-  can run in parallel. Tests skip cleanly when `INTEGRATION_DATABASE_URL`
-  is unset, so `go test ./...` never fails just because no DB is available.
-  Run with:
+| Layer | Flag | What it does |
+|---|---|---|
+| Go backend | `--backend` | Unit + API + security + integration + scheduler tests in a `golang:1.23-alpine` container |
+| Frontend | `--frontend` | Vitest unit/component tests in a `node:20-alpine` container |
+| Playwright E2E | `--e2e` | Browser smoke tests against the running Docker stack |
+| External HTTP API | `--external` | Real HTTP tests against `localhost:8080` — zero mocks, broad endpoint coverage |
 
-  ```bash
-  make test-integration \
-      INTEGRATION_DATABASE_URL=postgres://user:pw@localhost/portal_it?sslmode=disable
-  ```
+### Test architecture
 
-  The integration suite is the place to add coverage for RBAC, object
-  authorization, state machines, and audit-row presence — defects fakes
-  cannot catch.
+| Directory | Type | Mock-free? |
+|---|---|---|
+| `tests/external/` | Real HTTP calls to live Docker API — covers all registered endpoints | Yes |
+| `tests/api/` | Handler-level with in-process fakes (fast, catches handler bugs) | No |
+| `tests/unit/` | Pure function tests (dedup, flags, sessions, taxonomy, webhooks) | Yes |
+| `tests/security/` | Security and hardening checks | Mixed |
+| `tests/integration/` | Real PostgreSQL + real Echo middleware chain | Yes |
+| `cmd/scheduler/` | Scheduler timing helpers | Yes |
+| `web/src/tests/unit/` | Frontend store, API client | Unit-level |
+| `web/src/tests/component/` | Route guards, login, layout rendering | Unit-level |
+| `web/src/tests/e2e/` | Playwright browser smoke tests | Yes |
 
-Coverage target: >90% of prompt-critical behavior surface.
+To get exact current counts, run:
+
+```bash
+grep -rc '^func Test' tests/ cmd/ | awk -F: '{s+=$NF}END{print "Go:", s}'
+grep -rc 'it(' web/src/tests/ | awk -F: '{s+=$NF}END{print "Vitest:", s}'
+grep -rc '^test(' web/src/tests/e2e/ | awk -F: '{s+=$NF}END{print "E2E:", s}'
+```
+
+### Running individual layers
+
+```bash
+./run_tests.sh --backend     # Go tests only (no stack needed)
+./run_tests.sh --frontend    # Vitest only (no stack needed)
+./run_tests.sh --e2e         # Playwright only (stack must be running)
+./run_tests.sh --external    # External HTTP API only (stack must be running)
+```
+
+The script automatically starts the Docker stack before E2E and external tests if it's not already running, and injects the deterministic bootstrap credentials that match `infra/bootstrap/bootstrap-runtime.sh`.

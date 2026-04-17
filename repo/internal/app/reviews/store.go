@@ -249,6 +249,25 @@ func (s *Store) FlagForModeration(
 	return err
 }
 
+// ReviewExists reports whether a review row exists with the given id. Used by
+// the flag endpoint to return 404 for bogus ids instead of bubbling a raw
+// foreign-key failure up to the client as a 500.
+func (s *Store) ReviewExists(ctx context.Context, reviewID string) (bool, error) {
+	if reviewID == "" {
+		return false, nil
+	}
+	var exists bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM reviews WHERE id = $1::uuid)`,
+		reviewID,
+	).Scan(&exists)
+	if err != nil {
+		// Invalid uuid syntax → treat as "does not exist" so callers can 404.
+		return false, nil
+	}
+	return exists, nil
+}
+
 // getAttachments returns all attachments for a review (API-safe: no file paths).
 func (s *Store) getAttachments(ctx context.Context, reviewID string) []Attachment {
 	rows, _ := s.pool.Query(ctx, `

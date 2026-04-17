@@ -253,6 +253,14 @@ func (h *Handler) FlagReview(c echo.Context) error {
 		return common.BadRequest(c, "validation.required", "reason is required")
 	}
 
+	// Verify the review actually exists so a bogus id surfaces as 404 rather
+	// than a raw Postgres foreign-key error (would otherwise return 500).
+	if exists, err := h.store.ReviewExists(c.Request().Context(), reviewID); err != nil {
+		return common.Internal(c)
+	} else if !exists {
+		return common.ErrorResponse(c, http.StatusNotFound, "review.not_found", "Review not found")
+	}
+
 	if err := h.store.FlagForModeration(
 		c.Request().Context(), reviewID, req.Reason, userID,
 	); err != nil {

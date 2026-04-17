@@ -66,13 +66,24 @@ if [ ! -f "$SECRETS_DIR/webhook_signing_key.txt" ]; then
   log "Generated webhook_signing_key"
 fi
 
-# ── bootstrap account passwords (generated once, printed to manifest) ─────────
+# ── bootstrap account passwords ───────────────────────────────────────────────
+# Use deterministic default passwords so demo credentials are documented and
+# reproducible across deployments. Production deployments should rotate these
+# after first boot via the password-change API or admin UI.
+DEMO_PW_ADMIN="Portal-Admin-2026!"
+DEMO_PW_FINANCE="Portal-Finance-2026!"
+DEMO_PW_PROCUREMENT="Portal-Procurement-2026!"
+DEMO_PW_APPROVER="Portal-Approver-2026!"
+DEMO_PW_MODERATOR="Portal-Moderator-2026!"
+DEMO_PW_LEARNER="Portal-Learner-2026!"
+
 for role in learner procurement approver finance moderator admin; do
   f="$SECRETS_DIR/bootstrap_pw_${role}.txt"
   if [ ! -f "$f" ]; then
-    gen_password > "$f"
+    eval "pw=\$DEMO_PW_$(echo "$role" | tr '[:lower:]' '[:upper:]')"
+    printf '%s' "$pw" > "$f"
     chmod 600 "$f"
-    log "Generated bootstrap password for $role"
+    log "Set bootstrap password for $role"
   fi
 done
 

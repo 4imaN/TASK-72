@@ -1,13 +1,13 @@
 // Package external_test — real HTTP API tests against the live Docker stack.
 // No mocks. Every request is a real HTTP call to localhost:8080.
 //
-// Passwords are read from ADMIN_PW, FINANCE_PW, PROCUREMENT_PW, APPROVER_PW,
-// LEARNER_PW, MODERATOR_PW env vars. The run_tests.sh script extracts these
-// from Docker secrets before invoking the test.
+// Passwords are deterministic (set in infra/bootstrap/bootstrap-runtime.sh)
+// and injected via env vars ADMIN_PW, FINANCE_PW, etc. The run_tests.sh
+// script sets these automatically.
 //
 // Run: ./run_tests.sh --external
 // Or manually:
-//   export ADMIN_PW=$(docker compose exec -T api cat /runtime/secrets/bootstrap_pw_admin.txt)
+//   export ADMIN_PW="Portal-Admin-2026!" FINANCE_PW="Portal-Finance-2026!" ...
 //   go test ./tests/external/... -v -count=1
 package external_test
 
@@ -62,6 +62,23 @@ func (c *client) req(method, path string, body any) *http.Response {
 func (c *client) get(path string) *http.Response    { return c.req("GET", path, nil) }
 func (c *client) post(path string, body any) *http.Response { return c.req("POST", path, body) }
 func (c *client) put(path string, body any) *http.Response  { return c.req("PUT", path, body) }
+
+func (c *client) bodyString(resp *http.Response) string {
+	c.t.Helper()
+	defer resp.Body.Close()
+	buf := make([]byte, 0, 512)
+	tmp := make([]byte, 512)
+	for {
+		n, err := resp.Body.Read(tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+		}
+		if err != nil {
+			break
+		}
+	}
+	return string(buf)
+}
 
 func (c *client) jsonBody(resp *http.Response) map[string]any {
 	c.t.Helper()
@@ -606,11 +623,7 @@ func TestConfigVersionRuleSet(t *testing.T) {
 	resp := admin.put("/admin/config/version-rules", map[string]any{
 		"min_version": ver, "action": "warn", "message": "test",
 	})
-	// 200 = success, 500 = known schema edge on some deploys (grace_until column variance)
-	if resp.StatusCode != 200 && resp.StatusCode != 500 {
-		t.Errorf("expected 200 or 500, got %d", resp.StatusCode)
-	}
-	resp.Body.Close()
+	assertStatus(t, resp, 200)
 }
 
 // ─── Webhooks ────────────────────────────────────────────────────────────────
@@ -723,11 +736,17 @@ func TestAuditLog(t *testing.T) {
 	ensureAPI(t)
 	admin := loginAs(t, "bootstrap_admin", "ADMIN_PW")
 	resp := admin.get("/admin/audit")
-	// 200 = success, 500 = known schema edge on some deploys (audit_logs column variance)
-	if resp.StatusCode != 200 && resp.StatusCode != 500 {
-		t.Errorf("expected 200 or 500, got %d", resp.StatusCode)
+	// Must be 200. The "tolerate 500" version masked a real schema mismatch
+	// (audit_logs uses occurred_at, not created_at); that bug is now fixed
+	// so any 500 here is a real regression.
+	if resp.StatusCode != 200 {
+		resp.Body.Close()
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	body := admin.jsonBody(resp)
+	if _, ok := body["events"]; !ok {
+		t.Errorf("audit log response missing 'events' key: %v", body)
+	}
 }
 
 // ─── Procurement ─────────────────────────────────────────────────────────────
@@ -786,16 +805,33 @@ func TestProcurementRejectRequiresPermission(t *testing.T) {
 func TestMFAEndpoints(t *testing.T) {
 	ensureAPI(t)
 	admin := loginAs(t, "bootstrap_admin", "ADMIN_PW")
-	// These return errors (not enrolled, etc.) but should not 404
-	for _, path := range []string{
-		"/mfa/enroll/start", "/mfa/verify", "/mfa/recovery",
-		"/auth/mfa/verify", "/auth/mfa/recovery",
-	} {
-		resp := admin.post(path, map[string]string{"code": "000000"})
-		if resp.StatusCode == 404 {
-			t.Errorf("POST %s: unexpected 404", path)
-		}
+	// Exercise each MFA route with a plainly-wrong payload and assert it
+	// responds with a classified error (200 for enroll-start, 4xx otherwise),
+	// never 404/405/500. The old "not 404" check tolerated 500s.
+	cases := []struct {
+		path       string
+		okStatuses []int
+	}{
+		{"/mfa/enroll/start", []int{200}},
+		{"/mfa/verify", []int{400, 401, 403}},
+		{"/mfa/recovery", []int{400, 401, 403}},
+		{"/auth/mfa/verify", []int{400, 401}},
+		{"/auth/mfa/recovery", []int{400, 401}},
+	}
+	for _, tc := range cases {
+		resp := admin.post(tc.path, map[string]string{"code": "000000"})
+		got := resp.StatusCode
 		resp.Body.Close()
+		ok := false
+		for _, s := range tc.okStatuses {
+			if got == s {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			t.Errorf("POST %s: got %d, expected one of %v", tc.path, got, tc.okStatuses)
+		}
 	}
 }
 
@@ -804,12 +840,18 @@ func TestMFAEndpoints(t *testing.T) {
 func TestPasswordChangeEndpoint(t *testing.T) {
 	ensureAPI(t)
 	admin := loginAs(t, "bootstrap_admin", "ADMIN_PW")
+	// Send a request with missing new_password — should return 400, and importantly
+	// must NOT mutate any user state. Using current_password=wrong would actually
+	// rotate the password for bootstrap users (force_password_reset=true skips the
+	// current-password check), which would break all subsequent tests.
 	resp := admin.post("/auth/password/change", map[string]string{
-		"current_password": "wrong", "new_password": "SomeNewPass123!@#",
+		"current_password": "anything", "new_password": "",
 	})
-	// Should fail with 400/401 (wrong current password), not 404
 	if resp.StatusCode == 404 {
 		t.Error("password change: unexpected 404")
+	}
+	if resp.StatusCode != 400 {
+		t.Errorf("password change w/ empty new_password: expected 400, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 }
@@ -881,9 +923,10 @@ func TestRecordProgress(t *testing.T) {
 	resp := learner.post("/me/progress/00000000-0000-0000-0000-000000000000", map[string]any{
 		"event_type": "progress", "progress_pct": 50.0,
 	})
-	// 422 (not enrolled) or 200 — both valid; NOT 404
-	if resp.StatusCode == 404 {
-		t.Error("progress endpoint should not 404")
+	// Fake resource_id: backend rejects with 400 (validation) or 422 (unknown
+	// resource). Must never be 404 (route missing) or 500.
+	if resp.StatusCode != 400 && resp.StatusCode != 422 {
+		t.Errorf("progress on fake resource: expected 400/422, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 }
@@ -904,9 +947,9 @@ func TestReviewFlagEndpoint(t *testing.T) {
 	resp := proc.post("/reviews/00000000-0000-0000-0000-000000000000/flag", map[string]string{
 		"reason": "test flag",
 	})
-	// 404 or 500 with fake ID is expected — just verify route exists (not 405)
-	if resp.StatusCode == 405 {
-		t.Error("flag endpoint should not 405")
+	// Fake UUID → review not found. Must surface as 404, never 405 or 500.
+	if resp.StatusCode != 404 {
+		t.Errorf("flag on missing review: expected 404, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 }
@@ -917,8 +960,9 @@ func TestReviewReplyEndpoint(t *testing.T) {
 	resp := proc.post("/reviews/00000000-0000-0000-0000-000000000000/reply", map[string]string{
 		"reply_text": "test reply",
 	})
-	if resp.StatusCode == 405 {
-		t.Error("reply endpoint should not 405")
+	// Non-existent review → 403 (not own order) or 404. Never 405/500.
+	if resp.StatusCode != 403 && resp.StatusCode != 404 {
+		t.Errorf("reply on missing review: expected 403/404, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 }
@@ -927,9 +971,8 @@ func TestReviewDetailEndpoint(t *testing.T) {
 	ensureAPI(t)
 	admin := loginAs(t, "bootstrap_admin", "ADMIN_PW")
 	resp := admin.get("/reviews/00000000-0000-0000-0000-000000000000")
-	// 404 = review not found (expected with fake ID)
-	if resp.StatusCode == 405 || resp.StatusCode == 500 {
-		t.Errorf("review detail: unexpected %d", resp.StatusCode)
+	if resp.StatusCode != 404 {
+		t.Errorf("review detail missing id: expected 404, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 }
@@ -938,8 +981,8 @@ func TestReviewAttachmentEndpoint(t *testing.T) {
 	ensureAPI(t)
 	admin := loginAs(t, "bootstrap_admin", "ADMIN_PW")
 	resp := admin.get("/reviews/attachments/00000000-0000-0000-0000-000000000000")
-	if resp.StatusCode == 405 || resp.StatusCode == 500 {
-		t.Errorf("attachment download: unexpected %d", resp.StatusCode)
+	if resp.StatusCode != 404 {
+		t.Errorf("attachment missing id: expected 404, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 }
@@ -950,8 +993,9 @@ func TestAppealCreateEndpoint(t *testing.T) {
 	resp := proc.post("/appeals", map[string]any{
 		"review_id": "00000000-0000-0000-0000-000000000000", "reason": "test",
 	})
-	if resp.StatusCode == 405 {
-		t.Error("appeal create should not 405")
+	// Fake review_id → validation/lookup error. Must be 400/404, never 500.
+	if resp.StatusCode != 400 && resp.StatusCode != 404 {
+		t.Errorf("appeal create fake id: expected 400/404, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 }
@@ -960,8 +1004,8 @@ func TestAppealDetailEndpoint(t *testing.T) {
 	ensureAPI(t)
 	admin := loginAs(t, "bootstrap_admin", "ADMIN_PW")
 	resp := admin.get("/appeals/00000000-0000-0000-0000-000000000000")
-	if resp.StatusCode == 405 || resp.StatusCode == 500 {
-		t.Errorf("appeal detail: unexpected %d", resp.StatusCode)
+	if resp.StatusCode != 404 {
+		t.Errorf("appeal detail missing id: expected 404, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 }
@@ -972,8 +1016,9 @@ func TestAppealArbitrateEndpoint(t *testing.T) {
 	resp := admin.post("/appeals/00000000-0000-0000-0000-000000000000/arbitrate", map[string]string{
 		"outcome": "restore",
 	})
-	if resp.StatusCode == 405 {
-		t.Error("arbitrate should not 405")
+	// Fake appeal_id → 404. Never 405/500.
+	if resp.StatusCode != 404 {
+		t.Errorf("arbitrate missing id: expected 404, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 }
@@ -982,8 +1027,8 @@ func TestEvidenceDownloadEndpoint(t *testing.T) {
 	ensureAPI(t)
 	admin := loginAs(t, "bootstrap_admin", "ADMIN_PW")
 	resp := admin.get("/appeals/evidence/00000000-0000-0000-0000-000000000000")
-	if resp.StatusCode == 405 || resp.StatusCode == 500 {
-		t.Errorf("evidence download: unexpected %d", resp.StatusCode)
+	if resp.StatusCode != 404 {
+		t.Errorf("evidence download missing id: expected 404, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 }
@@ -994,8 +1039,8 @@ func TestModerationDecideEndpoint(t *testing.T) {
 	resp := admin.post("/moderation/queue/00000000-0000-0000-0000-000000000000/decide", map[string]string{
 		"decision": "approve",
 	})
-	if resp.StatusCode == 405 {
-		t.Error("moderation decide should not 405")
+	if resp.StatusCode != 404 {
+		t.Errorf("moderation decide missing id: expected 404, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 }
@@ -1015,7 +1060,7 @@ func TestSettlementBatchCreate(t *testing.T) {
 			"lines":  []map[string]any{{"amount": 1000, "direction": "AP", "cost_center_id": "CC-1"}},
 		})
 		if resp.StatusCode == 405 {
-			t.Error("batch create should not 405")
+			t.Error("batch create returns expected error for fake ID (not 405 method-not-allowed)")
 		}
 		resp.Body.Close()
 	}
@@ -1025,80 +1070,105 @@ func TestSettlementBatchDetail(t *testing.T) {
 	ensureAPI(t)
 	fin := loginAs(t, "bootstrap_finance", "FINANCE_PW")
 	resp := fin.get("/reconciliation/batches/00000000-0000-0000-0000-000000000000")
-	if resp.StatusCode == 405 {
-		t.Error("batch detail should not 405")
+	// Fake UUID → 404 (not found) is the correct behavior
+	body := fin.jsonBody(resp)
+	if resp.StatusCode != 404 {
+		t.Errorf("batch detail with fake ID: expected 404, got %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	if code, _ := body["code"].(string); code == "" {
+		t.Error("404 response should include an error code")
+	}
 }
 
 func TestVarianceSubmitApproval(t *testing.T) {
 	ensureAPI(t)
 	fin := loginAs(t, "bootstrap_finance", "FINANCE_PW")
 	resp := fin.post("/reconciliation/variances/00000000-0000-0000-0000-000000000000/submit-approval", nil)
-	if resp.StatusCode == 405 {
-		t.Error("variance submit should not 405")
+	body := fin.jsonBody(resp)
+	if resp.StatusCode != 409 {
+		t.Errorf("submit-approval on fake variance: expected 409, got %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	if code, _ := body["code"].(string); code != "reconciliation.invalid_state" {
+		t.Errorf("expected code=reconciliation.invalid_state, got %q", code)
+	}
 }
 
 func TestVarianceApprove(t *testing.T) {
 	ensureAPI(t)
 	fin := loginAs(t, "bootstrap_finance", "FINANCE_PW")
 	resp := fin.post("/reconciliation/variances/00000000-0000-0000-0000-000000000000/approve", nil)
-	if resp.StatusCode == 405 {
-		t.Error("variance approve should not 405")
+	body := fin.jsonBody(resp)
+	if resp.StatusCode != 409 {
+		t.Errorf("approve on fake variance: expected 409, got %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	if code, _ := body["code"].(string); code != "reconciliation.invalid_state" {
+		t.Errorf("expected code=reconciliation.invalid_state, got %q", code)
+	}
 }
 
 func TestVarianceApply(t *testing.T) {
 	ensureAPI(t)
 	fin := loginAs(t, "bootstrap_finance", "FINANCE_PW")
 	resp := fin.post("/reconciliation/variances/00000000-0000-0000-0000-000000000000/apply", nil)
-	if resp.StatusCode == 405 {
-		t.Error("variance apply should not 405")
+	body := fin.jsonBody(resp)
+	if resp.StatusCode != 409 {
+		t.Errorf("apply on fake variance: expected 409, got %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	if code, _ := body["code"].(string); code != "reconciliation.invalid_state" {
+		t.Errorf("expected code=reconciliation.invalid_state, got %q", code)
+	}
 }
 
 func TestBatchSubmit(t *testing.T) {
 	ensureAPI(t)
 	fin := loginAs(t, "bootstrap_finance", "FINANCE_PW")
 	resp := fin.post("/reconciliation/batches/00000000-0000-0000-0000-000000000000/submit", nil)
-	if resp.StatusCode == 405 {
-		t.Error("batch submit should not 405")
+	body := fin.jsonBody(resp)
+	if resp.StatusCode != 409 {
+		t.Errorf("submit on fake batch: expected 409, got %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	if code, _ := body["code"].(string); code != "reconciliation.invalid_state" {
+		t.Errorf("expected code=reconciliation.invalid_state, got %q", code)
+	}
 }
 
 func TestBatchApprove(t *testing.T) {
 	ensureAPI(t)
 	fin := loginAs(t, "bootstrap_finance", "FINANCE_PW")
 	resp := fin.post("/reconciliation/batches/00000000-0000-0000-0000-000000000000/approve", nil)
-	if resp.StatusCode == 405 {
-		t.Error("batch approve should not 405")
+	body := fin.jsonBody(resp)
+	if resp.StatusCode != 409 {
+		t.Errorf("approve on fake batch: expected 409, got %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	if code, _ := body["code"].(string); code != "reconciliation.invalid_state" {
+		t.Errorf("expected code=reconciliation.invalid_state, got %q", code)
+	}
 }
 
 func TestBatchExport(t *testing.T) {
 	ensureAPI(t)
 	fin := loginAs(t, "bootstrap_finance", "FINANCE_PW")
 	resp := fin.post("/reconciliation/batches/00000000-0000-0000-0000-000000000000/export", nil)
-	if resp.StatusCode == 405 {
-		t.Error("batch export should not 405")
+	body := fin.jsonBody(resp)
+	if resp.StatusCode != 409 {
+		t.Errorf("export on fake batch: expected 409, got %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	if code, _ := body["code"].(string); code != "reconciliation.invalid_state" {
+		t.Errorf("expected code=reconciliation.invalid_state, got %q", code)
+	}
 }
 
 func TestBatchSettle(t *testing.T) {
 	ensureAPI(t)
 	fin := loginAs(t, "bootstrap_finance", "FINANCE_PW")
 	resp := fin.post("/reconciliation/batches/00000000-0000-0000-0000-000000000000/settle", nil)
-	if resp.StatusCode == 405 {
-		t.Error("batch settle should not 405")
+	body := fin.jsonBody(resp)
+	if resp.StatusCode != 409 {
+		t.Errorf("settle on fake batch: expected 409, got %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	if code, _ := body["code"].(string); code != "reconciliation.invalid_state" {
+		t.Errorf("expected code=reconciliation.invalid_state, got %q", code)
+	}
 }
 
 func TestBatchVoid(t *testing.T) {
@@ -1107,18 +1177,22 @@ func TestBatchVoid(t *testing.T) {
 	resp := fin.post("/reconciliation/batches/00000000-0000-0000-0000-000000000000/void", map[string]string{
 		"reason": "test void",
 	})
-	if resp.StatusCode == 405 {
-		t.Error("batch void should not 405")
+	body := fin.jsonBody(resp)
+	if resp.StatusCode != 409 {
+		t.Errorf("void on fake batch: expected 409, got %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	if code, _ := body["code"].(string); code != "reconciliation.invalid_state" {
+		t.Errorf("expected code=reconciliation.invalid_state, got %q", code)
+	}
 }
 
 func TestExportJobDetail(t *testing.T) {
 	ensureAPI(t)
 	fin := loginAs(t, "bootstrap_finance", "FINANCE_PW")
 	resp := fin.get("/exports/jobs/00000000-0000-0000-0000-000000000000")
-	if resp.StatusCode == 405 {
-		t.Error("export job detail should not 405")
+	// Fake job → 404
+	if resp.StatusCode != 404 {
+		t.Errorf("export job with fake ID: expected 404, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 }
@@ -1127,8 +1201,8 @@ func TestExportJobDownload(t *testing.T) {
 	ensureAPI(t)
 	fin := loginAs(t, "bootstrap_finance", "FINANCE_PW")
 	resp := fin.get("/exports/jobs/00000000-0000-0000-0000-000000000000/download")
-	if resp.StatusCode == 405 {
-		t.Error("export download should not 405")
+	if resp.StatusCode != 404 {
+		t.Errorf("export download missing id: expected 404, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 }
@@ -1136,12 +1210,12 @@ func TestExportJobDownload(t *testing.T) {
 func TestTaxonomyConflictResolve(t *testing.T) {
 	ensureAPI(t)
 	admin := loginAs(t, "bootstrap_admin", "ADMIN_PW")
-	// Will 400 (no conflict with that ID) — just verify route exists
 	resp := admin.post("/taxonomy/conflicts/999999/resolve", map[string]string{
 		"resolution": "merged",
 	})
-	if resp.StatusCode == 405 {
-		t.Error("conflict resolve should not 405")
+	// Non-existent conflict → 404 or validation 400. Never 405/500.
+	if resp.StatusCode != 400 && resp.StatusCode != 404 {
+		t.Errorf("conflict resolve missing id: expected 400/404, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 }
@@ -1150,8 +1224,9 @@ func TestMFAEnrollStart(t *testing.T) {
 	ensureAPI(t)
 	admin := loginAs(t, "bootstrap_admin", "ADMIN_PW")
 	resp := admin.post("/mfa/enroll/start", nil)
-	if resp.StatusCode == 404 || resp.StatusCode == 405 {
-		t.Errorf("mfa enroll start: unexpected %d", resp.StatusCode)
+	// Admin always allowed to start enrollment → 200 (returns TOTP secret + QR).
+	if resp.StatusCode != 200 {
+		t.Errorf("mfa enroll start: expected 200, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 }
@@ -1160,8 +1235,9 @@ func TestMFAEnrollConfirm(t *testing.T) {
 	ensureAPI(t)
 	admin := loginAs(t, "bootstrap_admin", "ADMIN_PW")
 	resp := admin.post("/mfa/enroll/confirm", map[string]string{"code": "000000"})
-	if resp.StatusCode == 404 || resp.StatusCode == 405 {
-		t.Errorf("mfa enroll confirm: unexpected %d", resp.StatusCode)
+	// Admin has no pending enrollment OR code is wrong → 400/401. Never 404/405/500.
+	if resp.StatusCode != 400 && resp.StatusCode != 401 {
+		t.Errorf("mfa enroll confirm w/ invalid code: expected 400/401, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 }
@@ -1170,8 +1246,281 @@ func TestReconciliationProcessRun(t *testing.T) {
 	ensureAPI(t)
 	fin := loginAs(t, "bootstrap_finance", "FINANCE_PW")
 	resp := fin.post("/reconciliation/runs/00000000-0000-0000-0000-000000000000/process", nil)
-	if resp.StatusCode == 405 {
-		t.Error("process run should not 405")
+	// Fake run_id → 404 (not found). Never 405/500.
+	if resp.StatusCode != 404 {
+		t.Errorf("process run missing id: expected 404, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
+}
+
+// ─── Gap coverage: #1 GET /orders/:order_id/reviews ─────────────────────────
+
+func TestOrderReviewsEndpoint(t *testing.T) {
+	ensureAPI(t)
+	proc := loginAs(t, "bootstrap_procurement", "PROCUREMENT_PW")
+	// Create an order first so we have a real ID
+	resp := proc.post("/procurement/orders", map[string]any{
+		"vendor_name": "Review Test Vendor", "description": "test", "total_amount": 50.0,
+	})
+	m := proc.jsonBody(resp)
+	orderID, _ := m["id"].(string)
+	if orderID == "" {
+		t.Skip("could not create order")
+	}
+	// GET reviews for that order — should be 200 with empty list
+	resp = proc.get("/orders/" + orderID + "/reviews")
+	body := proc.jsonBody(resp)
+	if resp.StatusCode != 200 {
+		t.Errorf("GET /orders/:id/reviews: expected 200, got %d", resp.StatusCode)
+	}
+	if body["reviews"] == nil {
+		t.Error("response missing 'reviews' key")
+	}
+}
+
+// ─── Gap coverage: #2 POST /auth/logout ─────────────────────────────────────
+
+func TestAuthLogout(t *testing.T) {
+	ensureAPI(t)
+	pw := os.Getenv("ADMIN_PW")
+	if pw == "" {
+		t.Skip("ADMIN_PW not set")
+	}
+	// Login fresh (don't use cache — we need to invalidate this specific session)
+	c := &client{t: t}
+	resp := c.post("/auth/login", map[string]string{
+		"username": "bootstrap_admin", "password": pw,
+	})
+	for _, ck := range resp.Cookies() {
+		if ck.Name == "portal_session" {
+			c.cookie = ck.Value
+		}
+	}
+	resp.Body.Close()
+	if c.cookie == "" {
+		t.Fatal("login failed")
+	}
+	// Session should work
+	resp = c.get("/session")
+	if resp.StatusCode != 200 {
+		t.Fatalf("session before logout: %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Logout
+	resp = c.post("/auth/logout", nil)
+	if resp.StatusCode != 200 && resp.StatusCode != 204 {
+		t.Errorf("POST /auth/logout: expected 200/204, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Session should now fail
+	resp = c.get("/session")
+	if resp.StatusCode == 200 {
+		resp.Body.Close()
+		t.Error("session should be invalid after logout")
+	} else {
+		resp.Body.Close()
+	}
+}
+
+// ─── Gap coverage: #6 Strengthen assertion quality ──────────────────────────
+
+func TestUnauthenticatedAccessResponseBody(t *testing.T) {
+	ensureAPI(t)
+	c := &client{t: t}
+	resp := c.get("/catalog/resources")
+	body := c.jsonBody(resp)
+	if resp.StatusCode != 401 {
+		t.Fatalf("expected 401, got %d", resp.StatusCode)
+	}
+	code, _ := body["code"].(string)
+	msg, _ := body["message"].(string)
+	if code == "" && msg == "" {
+		t.Error("401 response should include code or message")
+	}
+}
+
+func TestLearnerForbiddenResponseBody(t *testing.T) {
+	ensureAPI(t)
+	learner := loginAs(t, "bootstrap_learner", "LEARNER_PW")
+	resp := learner.get("/admin/users")
+	body := learner.jsonBody(resp)
+	if resp.StatusCode != 403 {
+		t.Fatalf("expected 403, got %d", resp.StatusCode)
+	}
+	msg, _ := body["message"].(string)
+	if msg == "" {
+		t.Error("403 response should include a message")
+	}
+}
+
+func TestSearchResponseShape(t *testing.T) {
+	ensureAPI(t)
+	admin := loginAs(t, "bootstrap_admin", "ADMIN_PW")
+	resp := admin.get("/search?q=leadership")
+	body := admin.jsonBody(resp)
+	if body["results"] == nil {
+		t.Error("search response missing 'results'")
+	}
+	if body["total"] == nil {
+		t.Error("search response missing 'total'")
+	}
+	if body["limit"] == nil {
+		t.Error("search response missing 'limit'")
+	}
+}
+
+func TestRecommendationsResponseShape(t *testing.T) {
+	ensureAPI(t)
+	admin := loginAs(t, "bootstrap_admin", "ADMIN_PW")
+	resp := admin.get("/recommendations?limit=3")
+	body := admin.jsonBody(resp)
+	if body["items"] == nil {
+		t.Error("recommendations response missing 'items'")
+	}
+}
+
+func TestConfigFlagsResponseShape(t *testing.T) {
+	ensureAPI(t)
+	admin := loginAs(t, "bootstrap_admin", "ADMIN_PW")
+	resp := admin.get("/admin/config/flags")
+	body := admin.jsonBody(resp)
+	flags, _ := body["flags"].([]any)
+	if len(flags) == 0 {
+		t.Error("expected at least one seeded flag")
+	}
+	first, _ := flags[0].(map[string]any)
+	if first["key"] == nil {
+		t.Error("flag missing 'key'")
+	}
+	if first["enabled"] == nil {
+		t.Error("flag missing 'enabled'")
+	}
+}
+
+func TestAdminUsersResponseShape(t *testing.T) {
+	ensureAPI(t)
+	admin := loginAs(t, "bootstrap_admin", "ADMIN_PW")
+	resp := admin.get("/admin/users")
+	body := admin.jsonBody(resp)
+	users, _ := body["users"].([]any)
+	if len(users) == 0 {
+		t.Fatal("expected at least one user")
+	}
+	u, _ := users[0].(map[string]any)
+	for _, key := range []string{"id", "username", "email", "roles"} {
+		if u[key] == nil {
+			t.Errorf("user response missing '%s'", key)
+		}
+	}
+	// Email should be masked (not contain @)
+	email, _ := u["email"].(string)
+	if strings.Contains(email, "@") && !strings.Contains(email, "***") {
+		t.Error("email should be masked in user list response")
+	}
+}
+
+func TestProcurementOrderResponseShape(t *testing.T) {
+	ensureAPI(t)
+	proc := loginAs(t, "bootstrap_procurement", "PROCUREMENT_PW")
+	resp := proc.get("/procurement/orders?limit=1")
+	body := proc.jsonBody(resp)
+	if body["orders"] == nil {
+		t.Error("missing 'orders'")
+	}
+	if body["total"] == nil {
+		t.Error("missing 'total'")
+	}
+}
+
+// ─── Alias routes for full coverage ─────────────────────────────────────────
+
+func TestMFAAliasVerify(t *testing.T) {
+	ensureAPI(t)
+	admin := loginAs(t, "bootstrap_admin", "ADMIN_PW")
+	resp := admin.post("/auth/mfa/verify", map[string]string{"code": "000000"})
+	body := admin.jsonBody(resp)
+	// Should return 400/403 (bad code or not enrolled) — NOT 404 (route missing)
+	if resp.StatusCode == 404 {
+		t.Fatal("/auth/mfa/verify route does not exist")
+	}
+	if msg, _ := body["message"].(string); msg == "" && body["code"] == nil {
+		t.Error("MFA verify should return an error body with code or message")
+	}
+}
+
+func TestMFAAliasRecovery(t *testing.T) {
+	ensureAPI(t)
+	admin := loginAs(t, "bootstrap_admin", "ADMIN_PW")
+	resp := admin.post("/auth/mfa/recovery", map[string]string{"code": "000000"})
+	if resp.StatusCode == 404 {
+		t.Fatal("/auth/mfa/recovery route does not exist")
+	}
+	resp.Body.Close()
+}
+
+func TestMFAVerifyDirect(t *testing.T) {
+	ensureAPI(t)
+	admin := loginAs(t, "bootstrap_admin", "ADMIN_PW")
+	resp := admin.post("/mfa/verify", map[string]string{"code": "000000"})
+	if resp.StatusCode == 404 {
+		t.Fatal("/mfa/verify route does not exist")
+	}
+	resp.Body.Close()
+}
+
+func TestMFARecoveryDirect(t *testing.T) {
+	ensureAPI(t)
+	admin := loginAs(t, "bootstrap_admin", "ADMIN_PW")
+	resp := admin.post("/mfa/recovery", map[string]string{"code": "000000"})
+	if resp.StatusCode == 404 {
+		t.Fatal("/mfa/recovery route does not exist")
+	}
+	resp.Body.Close()
+}
+
+func TestVarianceSubmitApprovalExternal(t *testing.T) {
+	ensureAPI(t)
+	fin := loginAs(t, "bootstrap_finance", "FINANCE_PW")
+	resp := fin.post("/reconciliation/variances/00000000-0000-0000-0000-000000000001/submit-approval", nil)
+	if resp.StatusCode != 409 {
+		t.Errorf("submit-approval on fake variance: expected 409, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestVarianceApproveExternal(t *testing.T) {
+	ensureAPI(t)
+	fin := loginAs(t, "bootstrap_finance", "FINANCE_PW")
+	resp := fin.post("/reconciliation/variances/00000000-0000-0000-0000-000000000001/approve", nil)
+	if resp.StatusCode != 409 {
+		t.Errorf("approve on fake variance: expected 409, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestVarianceApplyExternal(t *testing.T) {
+	ensureAPI(t)
+	fin := loginAs(t, "bootstrap_finance", "FINANCE_PW")
+	resp := fin.post("/reconciliation/variances/00000000-0000-0000-0000-000000000001/apply", nil)
+	if resp.StatusCode != 409 {
+		t.Errorf("apply on fake variance: expected 409, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestArchiveBucketResourcesExternal(t *testing.T) {
+	ensureAPI(t)
+	admin := loginAs(t, "bootstrap_admin", "ADMIN_PW")
+	resp := admin.get("/archive/buckets/tag/nonexistent/resources")
+	body := admin.jsonBody(resp)
+	// Nonexistent bucket → 200 with empty resources list (not 404)
+	if resp.StatusCode != 200 {
+		t.Errorf("archive bucket resources: expected 200, got %d", resp.StatusCode)
+	}
+	resources, _ := body["resources"].([]any)
+	if len(resources) != 0 {
+		t.Errorf("expected empty resources for nonexistent bucket, got %d", len(resources))
+	}
 }

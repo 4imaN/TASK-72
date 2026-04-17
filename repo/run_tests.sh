@@ -62,14 +62,14 @@ ensure_stack() {
   fi
 }
 
-# ── Extract bootstrap passwords from Docker secrets ──────────────────────────
+# ── Bootstrap passwords (deterministic — matches bootstrap-runtime.sh) ────────
 extract_passwords() {
-  export ADMIN_PW=$(docker compose exec -T api cat /runtime/secrets/bootstrap_pw_admin.txt 2>/dev/null | tr -d '\r\n' || echo "")
-  export FINANCE_PW=$(docker compose exec -T api cat /runtime/secrets/bootstrap_pw_finance.txt 2>/dev/null | tr -d '\r\n' || echo "")
-  export PROCUREMENT_PW=$(docker compose exec -T api cat /runtime/secrets/bootstrap_pw_procurement.txt 2>/dev/null | tr -d '\r\n' || echo "")
-  export APPROVER_PW=$(docker compose exec -T api cat /runtime/secrets/bootstrap_pw_approver.txt 2>/dev/null | tr -d '\r\n' || echo "")
-  export LEARNER_PW=$(docker compose exec -T api cat /runtime/secrets/bootstrap_pw_learner.txt 2>/dev/null | tr -d '\r\n' || echo "")
-  export MODERATOR_PW=$(docker compose exec -T api cat /runtime/secrets/bootstrap_pw_moderator.txt 2>/dev/null | tr -d '\r\n' || echo "")
+  export ADMIN_PW="Portal-Admin-2026!"
+  export FINANCE_PW="Portal-Finance-2026!"
+  export PROCUREMENT_PW="Portal-Procurement-2026!"
+  export APPROVER_PW="Portal-Approver-2026!"
+  export LEARNER_PW="Portal-Learner-2026!"
+  export MODERATOR_PW="Portal-Moderator-2026!"
 }
 
 # ── 1. Backend tests (Go inside Docker) ─────────────────────────────────────
@@ -105,6 +105,7 @@ fi
 # ── 3. Playwright E2E (needs running stack) ─────────────────────────────────
 if run_all || [ "$E2E_ONLY" = true ]; then
   ensure_stack
+  extract_passwords  # same passwords used for UX tests that log in
 
   log "Running Playwright E2E tests..."
 
@@ -114,6 +115,12 @@ if run_all || [ "$E2E_ONLY" = true ]; then
     -w /src \
     -e BASE_URL="${BASE_URL:-http://localhost:3000}" \
     -e SKIP_WEBSERVER=1 \
+    -e ADMIN_PW="$ADMIN_PW" \
+    -e FINANCE_PW="$FINANCE_PW" \
+    -e PROCUREMENT_PW="$PROCUREMENT_PW" \
+    -e APPROVER_PW="$APPROVER_PW" \
+    -e LEARNER_PW="$LEARNER_PW" \
+    -e MODERATOR_PW="$MODERATOR_PW" \
     mcr.microsoft.com/playwright:v1.42.1-jammy \
     sh -c "npm ci --prefer-offline --silent 2>/dev/null; npx playwright test --reporter=line"; then
     pass "E2E tests"
